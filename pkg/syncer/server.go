@@ -82,9 +82,30 @@ type regionSyncStream struct {
 		syncutil.Mutex
 		sendIndex uint64
 	}
-	notifyCh chan bool
-	done     chan struct{}
-	once     sync.Once
+	// historyServed flips true once the leader has finished serving this
+	// follower's historical catch-up (i.e. syncHistoryRegion returned and the
+	// end-of-history marker was sent), which is exactly when the follower
+	// transitions to the incremental live stream and flips its own
+	// historySynced. It is the leader-side mirror of that boundary, used by
+	// CaughtUpMembers to bias leadership-transfer target selection. It is a
+	// best-effort hint only: the target's own region-syncer campaign gate
+	// remains the correctness backstop.
+	historyServed atomic.Bool
+	notifyCh      chan bool
+	done          chan struct{}
+	once          sync.Once
+}
+
+// markHistoryServed records that this stream has completed the historical
+// catch-up phase and entered incremental streaming.
+func (s *regionSyncStream) markHistoryServed() {
+	s.historyServed.Store(true)
+}
+
+// historyHasBeenServed reports whether the historical catch-up phase for this
+// stream has completed.
+func (s *regionSyncStream) historyHasBeenServed() bool {
+	return s.historyServed.Load()
 }
 
 func newRegionSyncStream(stream ServerStream, startIndex uint64) *regionSyncStream {
@@ -388,6 +409,10 @@ func (s *RegionSyncer) Sync(ctx context.Context, stream pdpb.PD_SyncRegionsServe
 			s.unbindStream(name, syncStream)
 			return err
 		}
+		// The historical catch-up is done and the end-of-history marker has been
+		// sent, so the follower is (about to be) caught up. Record it on the
+		// stream so CaughtUpMembers can prefer this follower as a transfer target.
+		syncStream.markHistoryServed()
 		go s.runDownstreamSender(ctx, name, syncStream)
 		select {
 		case <-ctx.Done():

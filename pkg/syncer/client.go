@@ -94,6 +94,46 @@ func (s *RegionSyncer) IsHistorySynced() bool {
 	return s.historySynced.Load()
 }
 
+// HasSyncableHistory reports whether this leader has distributed any region
+// history through the syncer (its history buffer is non-empty). It mirrors the
+// committed-region-count signal the campaign gate consults
+// (canCampaignAsRegionSyncerCaughtUp): when false, a fresh or empty cluster has
+// nothing for a follower to be behind on, so any member is a safe
+// leadership-transfer target even if it is not "caught up".
+func (s *RegionSyncer) HasSyncableHistory() bool {
+	return s.history.getNextIndex() > 0
+}
+
+// CaughtUpMembers returns the names of follower members whose region sync
+// stream has completed its historical catch-up (the leader finished serving the
+// bulk history and sent the end-of-history marker, so the follower transitions
+// to the incremental live stream and flips its own historySynced). Such members
+// are the safest targets for a leadership transfer: their local region store is
+// populated, so they can satisfy the region-syncer campaign gate and take over
+// immediately instead of stalling the election while empty.
+//
+// This is a best-effort hint: the per-stream historyServed flag can briefly
+// lead the follower's own historySynced (the end-of-history marker is sent but
+// not yet applied). That is safe because the target's own campaign gate
+// (canCampaignAsRegionSyncerCaughtUp) remains the correctness backstop — a stale
+// hint merely degrades target selection to the random fallback, never lets an
+// empty member lead. Disconnected followers are unbound from the stream map, so
+// they drop out of the candidate set.
+//
+// It is only meaningful on the current sync leader; on a follower the stream
+// map is empty and it returns nil.
+func (s *RegionSyncer) CaughtUpMembers() []string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	var names []string
+	for name, stream := range s.mu.streams {
+		if stream.historyHasBeenServed() {
+			names = append(names, name)
+		}
+	}
+	return names
+}
+
 func (s *RegionSyncer) syncRegion(ctx context.Context, conn *grpc.ClientConn) (ClientStream, error) {
 	cli := pdpb.NewPDClient(conn)
 	syncStream, err := cli.SyncRegions(ctx)

@@ -27,6 +27,7 @@ import (
 	"github.com/pingcap/failpoint"
 
 	"github.com/tikv/pd/pkg/core"
+	"github.com/tikv/pd/pkg/member"
 	"github.com/tikv/pd/pkg/utils/testutil"
 	"github.com/tikv/pd/server/config"
 	"github.com/tikv/pd/tests"
@@ -539,4 +540,95 @@ func TestUnsyncedMemberRefusesLeadership(t *testing.T) {
 	re.False(pd2.IsLeader(), "pd2 must not hold leadership while unsynced")
 	re.Empty(pd2.GetServer().GetBasicCluster().GetRegions(),
 		"pd2 region cache must stay empty while the syncer stream is blocked")
+}
+
+// TestExplicitTransferRefusedForUnsyncedTarget verifies the ResignEtcdLeader
+// decision for an explicit leadership transfer (e.g. the /leader/transfer/{name}
+// API): when the cluster has region data and the target has not caught up, the
+// transfer is refused with a clear reason and leadership does not move; on a
+// fresh/empty cluster any target is allowed. The committed/caught-up signals are
+// driven through the provider hooks so the decision is exercised deterministically
+// against a real etcd MoveLeader, independently of sync timing.
+func TestExplicitTransferRefusedForUnsyncedTarget(t *testing.T) {
+	re := require.New(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	cluster, err := tests.NewTestCluster(ctx, 2)
+	defer cluster.Destroy()
+	re.NoError(err)
+	re.NoError(cluster.RunInitialServers())
+	leaderName := cluster.WaitLeader()
+	re.NotEmpty(leaderName)
+	target := cluster.GetFollower()
+	re.NotEmpty(target)
+
+	m := cluster.GetLeaderServer().GetServer().GetMember()
+
+	// Cluster has region data but the target has not caught up -> refuse fast
+	// with the typed reason; leadership must not move.
+	m.SetHasCommittedRegionsProvider(func() bool { return true })
+	m.SetCaughtUpMembersProvider(func() []string { return nil })
+	err = m.ResignEtcdLeader(ctx, leaderName, target)
+	re.ErrorIs(err, member.ErrTransferTargetNotCaughtUp)
+	re.ErrorContains(err, target)
+	re.Equal(leaderName, cluster.GetLeaderServer().GetServer().Name())
+
+	// Fresh/empty cluster (no syncable region data): any target is safe, so the
+	// same explicit transfer is allowed and leadership moves to the target.
+	m.SetHasCommittedRegionsProvider(func() bool { return false })
+	re.NoError(m.ResignEtcdLeader(ctx, leaderName, target))
+	testutil.Eventually(re, func() bool {
+		return cluster.GetServer(target).IsLeader()
+	})
+}
+
+// TestExplicitTransferAllowedForCaughtUpTarget verifies that an explicit
+// transfer to a caught-up follower is allowed and moves leadership. It also
+// exercises the real markHistoryServed -> CaughtUpMembers path on the leader.
+func TestExplicitTransferAllowedForCaughtUpTarget(t *testing.T) {
+	re := require.New(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	re.NoError(failpoint.Enable("github.com/tikv/pd/pkg/storage/levelDBStorageFastFlush", `return(true)`))
+	defer func() {
+		re.NoError(failpoint.Disable("github.com/tikv/pd/pkg/storage/levelDBStorageFastFlush"))
+	}()
+
+	cluster, err := tests.NewTestCluster(ctx, 2, func(conf *config.Config, _ string) {
+		conf.PDServerCfg.UseRegionStorage = true
+	})
+	defer cluster.Destroy()
+	re.NoError(err)
+	re.NoError(cluster.RunInitialServers())
+	leaderName := cluster.WaitLeader()
+	re.NotEmpty(leaderName)
+	leaderServer := cluster.GetLeaderServer()
+	re.NoError(leaderServer.BootstrapCluster())
+	rc := leaderServer.GetServer().GetRaftCluster()
+	re.NotNil(rc)
+
+	for _, region := range tests.InitRegions(50) {
+		re.NoError(rc.HandleRegionHeartbeat(region))
+	}
+	re.True(rc.GetRegionSyncer().HasSyncableHistory())
+
+	// Wait until the follower is reported caught up in the leader's view; this
+	// is set by markHistoryServed once the leader finishes serving its history.
+	var target string
+	testutil.Eventually(re, func() bool {
+		caught := rc.GetRegionSyncer().CaughtUpMembers()
+		if len(caught) == 0 {
+			return false
+		}
+		target = caught[0]
+		return target != "" && target != leaderName
+	})
+
+	// Explicit transfer to a caught-up follower is allowed and moves leadership.
+	re.NoError(leaderServer.GetServer().GetMember().ResignEtcdLeader(ctx, leaderName, target))
+	testutil.Eventually(re, func() bool {
+		return cluster.GetServer(target).IsLeader()
+	})
 }

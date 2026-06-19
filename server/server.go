@@ -533,6 +533,30 @@ func (s *Server) startServer(ctx context.Context) error {
 	s.tsoAllocator = tso.NewAllocator(s.ctx, constant.DefaultKeyspaceGroupID, s.member, tsoStorage, s)
 	s.basicCluster = core.NewBasicCluster()
 	s.cluster = cluster.NewRaftCluster(ctx, s.GetMember(), s.GetBasicCluster(), s.GetStorage(), syncer.NewRegionSyncer(s), s.client, s.httpClient, s.tsoAllocator)
+	// Let leadership transfers prefer a region-syncer-caught-up target so the
+	// new leader is not stalled by the campaign gate (see
+	// canCampaignAsRegionSyncerCaughtUp). Resolve the syncer dynamically since
+	// the gate consults the live cluster too.
+	s.member.SetCaughtUpMembersProvider(func() []string {
+		if s.cluster == nil {
+			return nil
+		}
+		rs := s.cluster.GetRegionSyncer()
+		if rs == nil {
+			return nil
+		}
+		return rs.CaughtUpMembers()
+	})
+	// Refuse an explicit leadership transfer to a not-caught-up target only when
+	// the cluster actually has syncable region data; on a fresh/empty cluster any
+	// member is a safe target.
+	s.member.SetHasCommittedRegionsProvider(func() bool {
+		if s.cluster == nil {
+			return false
+		}
+		rs := s.cluster.GetRegionSyncer()
+		return rs != nil && rs.HasSyncableHistory()
+	})
 	keyspaceIDAllocator := id.NewAllocator(&id.AllocatorParams{
 		Client: s.client,
 		Label:  id.KeyspaceLabel,

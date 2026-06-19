@@ -16,9 +16,11 @@ package member
 
 import (
 	"context"
+	"fmt"
 	"math/rand/v2"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -64,6 +66,19 @@ type Member struct {
 	memberValue string
 	// lastLeaderUpdatedTime is the last time when the leader is updated.
 	lastLeaderUpdatedTime atomic.Value
+	// caughtUpMembersFn, when set, returns the names of members whose region
+	// syncer has caught up to this leader's history. ResignEtcdLeader uses it
+	// to bias "transfer to any member" target selection toward a caught-up
+	// member, so the new leader is not stalled by the region-syncer campaign
+	// gate while its local region store is still empty. Stored as
+	// func() []string; nil when not configured.
+	caughtUpMembersFn atomic.Value
+	// hasCommittedRegionsFn, when set, reports whether the cluster has region
+	// data distributed through the syncer (committed > 0). ResignEtcdLeader uses
+	// it to decide whether refusing a not-caught-up transfer target is
+	// warranted: on a fresh/empty cluster (false) any member is a safe target.
+	// Stored as func() bool; nil when not configured.
+	hasCommittedRegionsFn atomic.Value
 }
 
 // NewMember create a new Member.
@@ -83,6 +98,60 @@ func (m *Member) ID() uint64 {
 // Name returns the unique etcd Name for this server in etcd cluster.
 func (m *Member) Name() string {
 	return m.member.Name
+}
+
+// SetCaughtUpMembersProvider registers a function that returns the names of
+// members whose region syncer has caught up to this leader's history. It is
+// consulted by ResignEtcdLeader to prefer a caught-up transfer target. Passing
+// nil clears the provider. Safe to call concurrently with ResignEtcdLeader.
+func (m *Member) SetCaughtUpMembersProvider(fn func() []string) {
+	if fn == nil {
+		m.caughtUpMembersFn.Store((func() []string)(nil))
+		return
+	}
+	m.caughtUpMembersFn.Store(fn)
+}
+
+// caughtUpMembers returns the configured caught-up member names, or nil when no
+// provider is registered.
+func (m *Member) caughtUpMembers() []string {
+	v := m.caughtUpMembersFn.Load()
+	if v == nil {
+		return nil
+	}
+	fn, ok := v.(func() []string)
+	if !ok || fn == nil {
+		return nil
+	}
+	return fn()
+}
+
+// SetHasCommittedRegionsProvider registers a function reporting whether the
+// cluster has region data distributed through the syncer. ResignEtcdLeader
+// consults it before refusing a not-caught-up transfer target. Passing nil
+// clears the provider. Safe to call concurrently with ResignEtcdLeader.
+func (m *Member) SetHasCommittedRegionsProvider(fn func() bool) {
+	if fn == nil {
+		m.hasCommittedRegionsFn.Store((func() bool)(nil))
+		return
+	}
+	m.hasCommittedRegionsFn.Store(fn)
+}
+
+// hasCommittedRegions reports whether the cluster has syncable region data. It
+// returns false when no provider is registered, so the transfer refusal is
+// never triggered in setups that do not wire the signal (preserving the prior
+// behavior of always honoring an explicit transfer target).
+func (m *Member) hasCommittedRegions() bool {
+	v := m.hasCommittedRegionsFn.Load()
+	if v == nil {
+		return false
+	}
+	fn, ok := v.(func() bool)
+	if !ok || fn == nil {
+		return false
+	}
+	return fn()
 }
 
 // GetMember returns the member.
@@ -367,16 +436,78 @@ func (m *Member) ResignEtcdLeader(ctx context.Context, from string, nextEtcdLead
 		return nil
 	}
 
+	// Track candidate names alongside IDs so we can bias selection toward a
+	// region-syncer-caught-up member below.
+	candidateNames := make(map[uint64]string)
 	for _, member := range res.Members {
 		if (nextEtcdLeader == "" && member.ID != m.id) || (nextEtcdLeader != "" && member.Name == nextEtcdLeader) {
 			etcdLeaderIDs = append(etcdLeaderIDs, member.GetID())
+			candidateNames[member.GetID()] = member.GetName()
 		}
 	}
 	if len(etcdLeaderIDs) == 0 {
 		return errors.New("no valid pd to transfer etcd leader")
 	}
+	if nextEtcdLeader == "" {
+		// When transferring to any member, prefer one whose region syncer has
+		// caught up to our history. Otherwise the new leader may stall the PD
+		// election behind the region-syncer campaign gate (and, because PD
+		// leadership follows etcd leadership, leave the cluster leaderless until
+		// the gate's grace elapses). Fall back to the full candidate set when no
+		// caught-up member is known, so resign never blocks on an empty set.
+		if preferred := filterCaughtUpCandidates(etcdLeaderIDs, candidateNames, m.caughtUpMembers()); len(preferred) > 0 {
+			log.Info("prefer region-syncer-caught-up members as etcd leader transfer targets",
+				zap.Int("candidates", len(etcdLeaderIDs)), zap.Int("caught-up", len(preferred)))
+			etcdLeaderIDs = preferred
+		}
+	} else if shouldRefuseTransferTarget(nextEtcdLeader, m.caughtUpMembers(), m.hasCommittedRegions()) {
+		// An explicit target that has not caught up would stall behind the
+		// campaign gate, leaving the cluster leaderless until the grace elapses.
+		// Refuse fast with a clear reason so the operator can pick a caught-up
+		// member or retry, instead of suffering a silent unavailability window.
+		// On a fresh/empty cluster (no syncable history) any member is safe, so
+		// this does not apply.
+		return fmt.Errorf("cannot transfer PD leadership to %q (choose a caught-up member or retry): %w",
+			nextEtcdLeader, ErrTransferTargetNotCaughtUp)
+	}
 	nextEtcdLeaderID := etcdLeaderIDs[rand.IntN(len(etcdLeaderIDs))]
 	return m.MoveEtcdLeader(ctx, m.ID(), nextEtcdLeaderID)
+}
+
+// ErrTransferTargetNotCaughtUp is the cause returned when an explicit PD
+// leadership transfer is refused because the target member's region syncer has
+// not caught up to the current leader's history.
+var ErrTransferTargetNotCaughtUp = errors.New("region syncer has not caught up to the current leader's history")
+
+// shouldRefuseTransferTarget reports whether an explicit transfer to target must
+// be refused. It is refused only when the cluster has syncable region data
+// (hasCommitted) and the target is not among the caught-up members; on a
+// fresh/empty cluster any member is a safe target.
+func shouldRefuseTransferTarget(target string, caughtUp []string, hasCommitted bool) bool {
+	if !hasCommitted {
+		return false
+	}
+	return !slices.Contains(caughtUp, target)
+}
+
+// filterCaughtUpCandidates returns the subset of candidate IDs whose member
+// name appears in caughtUp. It returns nil when caughtUp is empty or no
+// candidate matches, signaling the caller to fall back to the full set.
+func filterCaughtUpCandidates(candidateIDs []uint64, candidateNames map[uint64]string, caughtUp []string) []uint64 {
+	if len(caughtUp) == 0 {
+		return nil
+	}
+	caughtUpSet := make(map[string]struct{}, len(caughtUp))
+	for _, name := range caughtUp {
+		caughtUpSet[name] = struct{}{}
+	}
+	var preferred []uint64
+	for _, id := range candidateIDs {
+		if _, ok := caughtUpSet[candidateNames[id]]; ok {
+			preferred = append(preferred, id)
+		}
+	}
+	return preferred
 }
 
 // SetMemberLeaderPriority saves a member's priority to be elected as the etcd leader.
