@@ -53,6 +53,14 @@ const (
 func (s *RegionSyncer) StopSyncWithLeader() {
 	s.reset()
 	s.wg.Wait()
+	// If this sync session never observed an end-of-history marker, the
+	// in-memory history index reflects a partial transfer that the leader
+	// never confirmed. Roll back to the last committed (persisted) index
+	// so the next leader sees a StartIndex that triggers a fresh bulk
+	// rather than a stale offset into a different leader's history space.
+	if !s.historySynced.Load() {
+		s.history.rollback()
+	}
 }
 
 func (s *RegionSyncer) reset() {
@@ -68,6 +76,62 @@ func (s *RegionSyncer) reset() {
 // ResetHistoryIndex resets and persists the next region sync history index.
 func (s *RegionSyncer) ResetHistoryIndex(index uint64) {
 	s.history.resetWithIndexAndPersist(index)
+}
+
+// HasAttemptedSync reports whether StartSyncWithLeader has ever been called
+// during this process's lifetime. Used by the leader-election path to tell
+// "I am a fresh single-node cluster" apart from "I am a follower that needs
+// to be caught up before campaigning".
+func (s *RegionSyncer) HasAttemptedSync() bool {
+	return s.attemptedSync.Load()
+}
+
+// IsHistorySynced reports whether this server has, at some point during its
+// lifetime, observed that it was caught up to a leader's history. The signal
+// is sticky: once true, the local region storage is durably populated and
+// further syncs only extend that state.
+func (s *RegionSyncer) IsHistorySynced() bool {
+	return s.historySynced.Load()
+}
+
+// HasSyncableHistory reports whether this leader has distributed any region
+// history through the syncer (its history buffer is non-empty). It mirrors the
+// committed-region-count signal the campaign gate consults
+// (canCampaignAsRegionSyncerCaughtUp): when false, a fresh or empty cluster has
+// nothing for a follower to be behind on, so any member is a safe
+// leadership-transfer target even if it is not "caught up".
+func (s *RegionSyncer) HasSyncableHistory() bool {
+	return s.history.getNextIndex() > 0
+}
+
+// CaughtUpMembers returns the names of follower members whose region sync
+// stream has completed its historical catch-up (the leader finished serving the
+// bulk history and sent the end-of-history marker, so the follower transitions
+// to the incremental live stream and flips its own historySynced). Such members
+// are the safest targets for a leadership transfer: their local region store is
+// populated, so they can satisfy the region-syncer campaign gate and take over
+// immediately instead of stalling the election while empty.
+//
+// This is a best-effort hint: the per-stream historyServed flag can briefly
+// lead the follower's own historySynced (the end-of-history marker is sent but
+// not yet applied). That is safe because the target's own campaign gate
+// (canCampaignAsRegionSyncerCaughtUp) remains the correctness backstop — a stale
+// hint merely degrades target selection to the random fallback, never lets an
+// empty member lead. Disconnected followers are unbound from the stream map, so
+// they drop out of the candidate set.
+//
+// It is only meaningful on the current sync leader; on a follower the stream
+// map is empty and it returns nil.
+func (s *RegionSyncer) CaughtUpMembers() []string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	var names []string
+	for name, stream := range s.mu.streams {
+		if stream.historyHasBeenServed() {
+			names = append(names, name)
+		}
+	}
+	return names
 }
 
 func (s *RegionSyncer) syncRegion(ctx context.Context, conn *grpc.ClientConn) (ClientStream, error) {
@@ -126,6 +190,22 @@ func (s *RegionSyncer) handleRegionSyncResponse(
 	}
 	hasStats := len(stats) == len(regions)
 	hasBuckets := len(buckets) == len(regions)
+	// An empty-regions response is the explicit end-of-history
+	// marker: sent by the leader at the end of a bulk transfer,
+	// at the end of an incremental catch-up, as an "already in
+	// sync" reply, or as a keepalive. Receiving one commits the
+	// historical phase — we flush the accumulated history index
+	// to disk and flip historySynced, which both opens the
+	// leader-election gate and switches subsequent records from
+	// the non-persisting catch-up path to the normal persisting
+	// live-stream path.
+	if len(regions) == 0 {
+		if !s.historySynced.Load() {
+			s.history.commit()
+		}
+		s.historySynced.Store(true)
+	}
+	inCatchup := !s.historySynced.Load()
 	for i, r := range regions {
 		var (
 			region       *core.RegionInfo
@@ -165,7 +245,16 @@ func (s *RegionSyncer) handleRegionSyncResponse(
 			err = regionStorage.SaveRegion(r)
 		}
 		if err == nil && !inFullSync {
-			s.history.record(region)
+			// Full-sync frames carry positional offsets, not reusable history
+			// indices, so they are applied to storage but not recorded here.
+			// Records during historical catch-up are buffered without persisting
+			// and flushed by commit() on the end-of-history marker; live records
+			// after catch-up persist normally.
+			if inCatchup {
+				s.history.recordNoPersist(region)
+			} else {
+				s.history.record(region)
+			}
 		}
 		for _, old := range overlaps {
 			_ = regionStorage.DeleteRegion(old.GetMeta())
@@ -187,7 +276,7 @@ func (s *RegionSyncer) IsRunning() bool {
 // StartSyncWithLeader starts to sync with leader.
 func (s *RegionSyncer) StartSyncWithLeader(addr string) {
 	s.wg.Add(1)
-
+	s.attemptedSync.Store(true)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.mu.clientCtx, s.mu.clientCancel = context.WithCancel(s.server.LoopContext())

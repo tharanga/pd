@@ -27,6 +27,7 @@ import (
 	"github.com/pingcap/failpoint"
 
 	"github.com/tikv/pd/pkg/core"
+	"github.com/tikv/pd/pkg/member"
 	"github.com/tikv/pd/pkg/utils/testutil"
 	"github.com/tikv/pd/server/config"
 	"github.com/tikv/pd/tests"
@@ -425,4 +426,209 @@ func TestPrepareCheckerWithTransferLeader(t *testing.T) {
 	rc = cluster.GetLeaderServer().GetServer().GetRaftCluster()
 	re.True(rc.IsPrepared())
 	re.NoError(failpoint.Disable("github.com/tikv/pd/pkg/schedule/changeCoordinatorTicker"))
+}
+
+// TestUnsyncedMemberRefusesLeadership is a regression test for the race where
+// a freshly joined PD with empty region storage could take over leadership
+// before its region syncer had populated the local store. The fix gates the
+// campaign in leaderLoop on the region syncer having observed catch-up with
+// the previous leader.
+//
+// Test plan:
+//  1. Bring up a 1-node cluster (pd1) with UseRegionStorage = true, populate
+//     it with regions, and wait for them to flush to leveldb.
+//  2. Enable the `disableClientStreaming` failpoint so any new follower's
+//     syncer client fails to receive any regions — modelling a brand-new
+//     member that has not (yet) caught up.
+//  3. Join pd2. It comes up as a follower but cannot sync.
+//  4. Resign pd1's leadership. Without the fix, pd2 would campaign and win
+//     with an empty cache; with the fix, pd2 must refuse to campaign.
+//  5. Poll for a window after the resign, asserting pd2 never holds
+//     leadership with a partial region set and that the syncer state
+//     machine stays in "attempted but not synced" — the precise state the
+//     gate is supposed to catch.
+//
+// Recovery (releasing the failpoint and letting pd2 eventually catch up and
+// take leadership) is not exercised here because, in a 2-node cluster after
+// `ResignLeader`, the cluster sits leaderless until the `leaderLoop`'s
+// lost-PD-leader timeout (~40 s) fires and reclaims etcd leadership for
+// pd1 — longer than a reasonable Eventually deadline. The gate's recovery
+// behaviour is the same path the cluster takes on any natural leader
+// failover and is covered by the existing TestRegionSyncer / TestFullSync*
+// scenarios.
+func TestUnsyncedMemberRefusesLeadership(t *testing.T) {
+	re := require.New(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	re.NoError(failpoint.Enable("github.com/tikv/pd/pkg/storage/levelDBStorageFastFlush", `return(true)`))
+	defer func() {
+		re.NoError(failpoint.Disable("github.com/tikv/pd/pkg/storage/levelDBStorageFastFlush"))
+	}()
+
+	cluster, err := tests.NewTestCluster(ctx, 1, func(conf *config.Config, _ string) {
+		conf.PDServerCfg.UseRegionStorage = true
+	})
+	defer cluster.Destroy()
+	re.NoError(err)
+
+	re.NoError(cluster.RunInitialServers())
+	re.NotEmpty(cluster.WaitLeader())
+	leaderServer := cluster.GetLeaderServer()
+	re.NoError(leaderServer.BootstrapCluster())
+	rc := leaderServer.GetServer().GetRaftCluster()
+	re.NotNil(rc)
+
+	// Populate the leader with regions and wait for them to be flushed to
+	// leveldb (the local region storage flush interval is ~3s).
+	regionLen := 110
+	regions := tests.InitRegions(regionLen)
+	for _, region := range regions {
+		re.NoError(rc.HandleRegionHeartbeat(region))
+	}
+	time.Sleep(4 * time.Second)
+	re.Len(leaderServer.GetServer().GetBasicCluster().GetRegions(), regionLen)
+
+	// Block region-syncer clients from establishing a stream. Any follower
+	// that joins after this point will never receive history regions.
+	re.NoError(failpoint.Enable("github.com/tikv/pd/pkg/syncer/disableClientStreaming", `return(true)`))
+	defer func() {
+		re.NoError(failpoint.Disable("github.com/tikv/pd/pkg/syncer/disableClientStreaming"))
+	}()
+
+	// Join a brand-new PD. Its leveldb starts empty and the failpoint
+	// prevents its syncer client from filling it.
+	pd2, err := cluster.Join(ctx)
+	re.NoError(err)
+	re.NoError(pd2.Run())
+	re.Equal("pd1", cluster.WaitLeader())
+
+	// Confirm pd2 is wired up as a follower whose local region cache is still
+	// empty: the disableClientStreaming failpoint stops its syncer from ever
+	// establishing a stream, so it never catches up to pd1's history.
+	testutil.Eventually(re, func() bool {
+		return pd2.GetServer().DirectlyGetRaftCluster() != nil
+	})
+	re.Empty(pd2.GetServer().GetBasicCluster().GetRegions())
+
+	// Resign pd1. Without the fix, pd2's leaderLoop would unblock from
+	// leader.Watch(), call StopSyncWithLeader, then campaign and win with an
+	// empty region cache. With the fix the gate forces pd2 to skip the
+	// campaign while it is not caught up.
+	re.NoError(cluster.ResignLeader())
+
+	// Observe the gate firing. pd2 must log "skip campaigning of pd leader:
+	// region syncer has not caught up" on every leader-loop iteration as long
+	// as the failpoint keeps its syncer from catching up. We poll for a few
+	// seconds to confirm the gate stays closed rather than flipping open by
+	// accident.
+	const observeWindow = 3 * time.Second
+	deadline := time.Now().Add(observeWindow)
+	for time.Now().Before(deadline) {
+		if pd2.IsLeader() && len(pd2.GetServer().GetBasicCluster().GetRegions()) < regionLen {
+			re.FailNowf("gate failed",
+				"unsynced pd2 became leader with %d/%d regions",
+				len(pd2.GetServer().GetBasicCluster().GetRegions()), regionLen)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	// Final guard: pd2 must not hold leadership while its region cache is
+	// still empty. On unfixed code (no campaign gate) pd2 wins the election
+	// pd1 vacated and serves an empty region set, so this assertion — or the
+	// observe loop above — fails, reproducing the bug.
+	re.False(pd2.IsLeader(), "pd2 must not hold leadership while unsynced")
+	re.Empty(pd2.GetServer().GetBasicCluster().GetRegions(),
+		"pd2 region cache must stay empty while the syncer stream is blocked")
+}
+
+// TestExplicitTransferRefusedForUnsyncedTarget verifies the ResignEtcdLeader
+// decision for an explicit leadership transfer (e.g. the /leader/transfer/{name}
+// API): when the cluster has region data and the target has not caught up, the
+// transfer is refused with a clear reason and leadership does not move; on a
+// fresh/empty cluster any target is allowed. The committed/caught-up signals are
+// driven through the provider hooks so the decision is exercised deterministically
+// against a real etcd MoveLeader, independently of sync timing.
+func TestExplicitTransferRefusedForUnsyncedTarget(t *testing.T) {
+	re := require.New(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	cluster, err := tests.NewTestCluster(ctx, 2)
+	defer cluster.Destroy()
+	re.NoError(err)
+	re.NoError(cluster.RunInitialServers())
+	leaderName := cluster.WaitLeader()
+	re.NotEmpty(leaderName)
+	target := cluster.GetFollower()
+	re.NotEmpty(target)
+
+	m := cluster.GetLeaderServer().GetServer().GetMember()
+
+	// Cluster has region data but the target has not caught up -> refuse fast
+	// with the typed reason; leadership must not move.
+	m.SetHasCommittedRegionsProvider(func() bool { return true })
+	m.SetCaughtUpMembersProvider(func() []string { return nil })
+	err = m.ResignEtcdLeader(ctx, leaderName, target)
+	re.ErrorIs(err, member.ErrTransferTargetNotCaughtUp)
+	re.ErrorContains(err, target)
+	re.Equal(leaderName, cluster.GetLeaderServer().GetServer().Name())
+
+	// Fresh/empty cluster (no syncable region data): any target is safe, so the
+	// same explicit transfer is allowed and leadership moves to the target.
+	m.SetHasCommittedRegionsProvider(func() bool { return false })
+	re.NoError(m.ResignEtcdLeader(ctx, leaderName, target))
+	testutil.Eventually(re, func() bool {
+		return cluster.GetServer(target).IsLeader()
+	})
+}
+
+// TestExplicitTransferAllowedForCaughtUpTarget verifies that an explicit
+// transfer to a caught-up follower is allowed and moves leadership. It also
+// exercises the real markHistoryServed -> CaughtUpMembers path on the leader.
+func TestExplicitTransferAllowedForCaughtUpTarget(t *testing.T) {
+	re := require.New(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	re.NoError(failpoint.Enable("github.com/tikv/pd/pkg/storage/levelDBStorageFastFlush", `return(true)`))
+	defer func() {
+		re.NoError(failpoint.Disable("github.com/tikv/pd/pkg/storage/levelDBStorageFastFlush"))
+	}()
+
+	cluster, err := tests.NewTestCluster(ctx, 2, func(conf *config.Config, _ string) {
+		conf.PDServerCfg.UseRegionStorage = true
+	})
+	defer cluster.Destroy()
+	re.NoError(err)
+	re.NoError(cluster.RunInitialServers())
+	leaderName := cluster.WaitLeader()
+	re.NotEmpty(leaderName)
+	leaderServer := cluster.GetLeaderServer()
+	re.NoError(leaderServer.BootstrapCluster())
+	rc := leaderServer.GetServer().GetRaftCluster()
+	re.NotNil(rc)
+
+	for _, region := range tests.InitRegions(50) {
+		re.NoError(rc.HandleRegionHeartbeat(region))
+	}
+	re.True(rc.GetRegionSyncer().HasSyncableHistory())
+
+	// Wait until the follower is reported caught up in the leader's view; this
+	// is set by markHistoryServed once the leader finishes serving its history.
+	var target string
+	testutil.Eventually(re, func() bool {
+		caught := rc.GetRegionSyncer().CaughtUpMembers()
+		if len(caught) == 0 {
+			return false
+		}
+		target = caught[0]
+		return target != "" && target != leaderName
+	})
+
+	// Explicit transfer to a caught-up follower is allowed and moves leadership.
+	re.NoError(leaderServer.GetServer().GetMember().ResignEtcdLeader(ctx, leaderName, target))
+	testutil.Eventually(re, func() bool {
+		return cluster.GetServer(target).IsLeader()
+	})
 }

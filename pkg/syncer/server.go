@@ -50,9 +50,13 @@ const (
 	maxSyncRegionBatchSize      = 1000
 	syncerKeepAliveInterval     = 10 * time.Second
 	historyBufferShrinkInterval = 5 * time.Minute
-	defaultHistoryBufferSize    = 10000
-	historyBufferMemoryStep     = 4 * 1024 * 1024 * 1024
-	maxHistoryBufferSize        = 80000
+	// The frequency to check and publish the region count the leader is
+	// serving so that other members can tell whether they are caught up
+	// before campaigning.
+	committedRegionCountInterval = time.Second
+	defaultHistoryBufferSize     = 10000
+	historyBufferMemoryStep      = 4 * 1024 * 1024 * 1024
+	maxHistoryBufferSize         = 80000
 )
 
 // ClientStream is the client side of the region syncer.
@@ -78,9 +82,30 @@ type regionSyncStream struct {
 		syncutil.Mutex
 		sendIndex uint64
 	}
-	notifyCh chan bool
-	done     chan struct{}
-	once     sync.Once
+	// historyServed flips true once the leader has finished serving this
+	// follower's historical catch-up (i.e. syncHistoryRegion returned and the
+	// end-of-history marker was sent), which is exactly when the follower
+	// transitions to the incremental live stream and flips its own
+	// historySynced. It is the leader-side mirror of that boundary, used by
+	// CaughtUpMembers to bias leadership-transfer target selection. It is a
+	// best-effort hint only: the target's own region-syncer campaign gate
+	// remains the correctness backstop.
+	historyServed atomic.Bool
+	notifyCh      chan bool
+	done          chan struct{}
+	once          sync.Once
+}
+
+// markHistoryServed records that this stream has completed the historical
+// catch-up phase and entered incremental streaming.
+func (s *regionSyncStream) markHistoryServed() {
+	s.historyServed.Store(true)
+}
+
+// historyHasBeenServed reports whether the historical catch-up phase for this
+// stream has completed.
+func (s *regionSyncStream) historyHasBeenServed() bool {
+	return s.historyServed.Load()
 }
 
 func newRegionSyncStream(stream ServerStream, startIndex uint64) *regionSyncStream {
@@ -193,6 +218,13 @@ type RegionSyncer struct {
 	tlsConfig   *grpcutil.TLSConfig
 	// status when as client
 	streamingRunning atomic.Bool
+	// attempted sync status as client, sticky for the process lifetime.
+	// It is used to distinguish follower from never attempted to sync (e.g., bootstrapp).
+	attemptedSync atomic.Bool
+	// status of the historitcal catch-up as client, sticky for the process lifetime.
+	// set to true once the client has observed that it has completed the historitcal
+	// catch-up/ the local region storage is durably populated.
+	historySynced atomic.Bool
 }
 
 // NewRegionSyncer returns a region syncer that ensures final consistency through the heartbeat,
@@ -211,6 +243,7 @@ func NewRegionSyncer(s Server) *RegionSyncer {
 		tlsConfig:   s.GetTLSConfig(),
 	}
 	syncer.mu.streams = make(map[string]*regionSyncStream)
+	syncer.reloadHistorySyncedFromDurableState()
 	return syncer
 }
 
@@ -229,12 +262,56 @@ func historyBufferMaxSizeFromMemory(totalMemory uint64) int {
 	return size
 }
 
+// This function seeds the in-memory historySynced
+// flag from the persisted historyIndex so a node that previously completed
+// a sync isn't permanently locked out of campaigning after a restart
+// followed by a leader death mid-sync. A non-zero index only ever lands on
+// disk via commit() (after a bulk applied via SaveRegion) or via record()'s
+// flushCount path, so a non-zero index implies the local region storage was
+// populated by a prior successful catch-up — sufficient evidence of durable
+// state without any extra probe. Invoked once from NewRegionSyncer; safe to
+// call before any sync session because nothing else has touched historySynced yet.
+// TODO : this doesn't attempt to fix the gap problem https://github.com/tikv/pd/issues/10668
+func (s *RegionSyncer) reloadHistorySyncedFromDurableState() {
+	if s.history.getNextIndex() > 0 {
+		s.historySynced.Store(true)
+	}
+}
+
 // RunServer runs the server of the region syncer.
 // regionNotifier is used to get the changed regions.
 func (s *RegionSyncer) RunServer(ctx context.Context, regionNotifier <-chan *core.RegionInfo) {
 	var records []*core.RegionInfo
 	keepAliveTicker := time.NewTicker(syncerKeepAliveInterval)
 	shrinkTicker := time.NewTicker(historyBufferShrinkInterval)
+	committedCountTicker := time.NewTicker(committedRegionCountInterval)
+	// -1 forces an initial publish on the first tick.
+	lastPublishedRegionCount := -1
+	publishCommittedRegionCount := func() {
+		count := s.server.GetBasicCluster().GetTotalRegionCount()
+		// Only advertise a non-zero committed count once regions have actually
+		// entered the syncer history and thus become syncable by followers.
+		// Regions present in the basic cluster but that never flowed through the
+		// heartbeat -> changedRegions -> history path (most notably the bootstrap
+		// region) cannot have been synced by any follower. Counting them would
+		// keep the region-syncer campaign gate (canCampaignAsRegionSyncerCaughtUp)
+		// permanently closed and stall the next leader election until the grace
+		// elapses, even though no follower could possibly be caught up.
+		if s.history.getNextIndex() == 0 {
+			count = 0
+		}
+		if count != lastPublishedRegionCount {
+			if err := s.server.GetStorage().SaveRegionSyncerCommittedRegionCount(uint64(count)); err != nil {
+				log.Warn("failed to persist committed region count", errs.ZapError(err))
+			} else {
+				lastPublishedRegionCount = count
+			}
+		}
+	}
+	// Publish the region count immediately to minimize the poissibility of a leader dies
+	// immediately and a new campaign gate misclassifies an unsynced follower as
+	// already caught up.
+	publishCommittedRegionCount()
 
 	processRegion := func(region *core.RegionInfo) {
 		records = append(records, region)
@@ -244,6 +321,7 @@ func (s *RegionSyncer) RunServer(ctx context.Context, regionNotifier <-chan *cor
 	defer func() {
 		keepAliveTicker.Stop()
 		shrinkTicker.Stop()
+		committedCountTicker.Stop()
 		s.mu.Lock()
 		for _, stream := range s.mu.streams {
 			stream.close()
@@ -274,6 +352,12 @@ func (s *RegionSyncer) RunServer(ctx context.Context, regionNotifier <-chan *cor
 			s.broadcast(ctx, records, false)
 		case <-shrinkTicker.C:
 			s.history.maybeShrink()
+		case <-committedCountTicker.C:
+			// Publish the region count this leader is serving so that a member
+			// that has not finished a history sync can still decide, after this
+			// leader is gone, whether it is caught up enough to campaign. Only
+			// the leader runs RunServer, so only the leader writes this.
+			publishCommittedRegionCount()
 		case <-keepAliveTicker.C:
 			s.broadcast(ctx, nil, true)
 		}
@@ -325,6 +409,10 @@ func (s *RegionSyncer) Sync(ctx context.Context, stream pdpb.PD_SyncRegionsServe
 			s.unbindStream(name, syncStream)
 			return err
 		}
+		// The historical catch-up is done and the end-of-history marker has been
+		// sent, so the follower is (about to be) caught up. Record it on the
+		// stream so CaughtUpMembers can prefer this follower as a transfer target.
+		syncStream.markHistoryServed()
 		go s.runDownstreamSender(ctx, name, syncStream)
 		select {
 		case <-ctx.Done():
@@ -420,7 +508,7 @@ func (s *RegionSyncer) syncHistoryRegionLocked(
 		zap.Uint64("from-index", startIndex),
 		zap.Uint64("last-index", endIndex),
 		zap.Int("records-length", len(records)))
-	return s.syncHistoryRecordsLocked(startIndex, records, syncStream)
+	return s.syncHistoryRecordsLocked(startIndex, records, syncStream, true)
 }
 
 func buildSyncRegionResponse(startIndex uint64, records []*core.RegionInfo) *pdpb.SyncRegionResponse {
@@ -455,17 +543,28 @@ func buildSyncRegionResponse(startIndex uint64, records []*core.RegionInfo) *pdp
 func (s *RegionSyncer) syncHistoryRecords(startIndex uint64, records []*core.RegionInfo, stream *regionSyncStream) error {
 	stream.sendMu.Lock()
 	defer stream.sendMu.Unlock()
-	return s.syncHistoryRecordsLocked(startIndex, records, stream)
+	return s.syncHistoryRecordsLocked(startIndex, records, stream, true)
 }
 
-func (*RegionSyncer) syncHistoryRecordsLocked(startIndex uint64, records []*core.RegionInfo, stream *regionSyncStream) error {
+// syncHistoryRecordsLocked streams records in batches. When sendEndMarker is
+// true it appends an end-of-history marker (empty regions) so the follower can
+// commit its history index and flip historySynced. The full-sync path passes
+// false because it streams positional batches and sends its own completion
+// marker at the leader's real next index instead.
+func (*RegionSyncer) syncHistoryRecordsLocked(startIndex uint64, records []*core.RegionInfo, stream *regionSyncStream, sendEndMarker bool) error {
 	for start := 0; start < len(records); start += maxSyncRegionBatchSize {
 		end := min(start+maxSyncRegionBatchSize, len(records))
 		if err := stream.sendStreamIfOpen(buildSyncRegionResponse(startIndex+uint64(start), records[start:end])); err != nil {
 			return err
 		}
 	}
-	return nil
+	if !sendEndMarker {
+		return nil
+	}
+	return stream.sendStreamIfOpen(&pdpb.SyncRegionResponse{
+		Header:     &pdpb.ResponseHeader{ClusterId: keypath.ClusterID()},
+		StartIndex: startIndex + uint64(len(records)),
+	})
 }
 
 func (s *RegionSyncer) syncFullRegionsLocked(ctx context.Context, name string, syncStream *regionSyncStream, syncStartIndex uint64) error {
@@ -542,11 +641,16 @@ func (s *RegionSyncer) syncFullRegionsLocked(ctx context.Context, name string, s
 		if len(regions) == 0 {
 			catchUpStartIndex = 0
 		}
-		if err := s.syncHistoryRecordsLocked(catchUpStartIndex, records, syncStream); err != nil {
+		// Full-sync batches are positional, so stream them without an
+		// end-of-history marker; the completion marker below carries the real
+		// next index.
+		if err := s.syncHistoryRecordsLocked(catchUpStartIndex, records, syncStream, false); err != nil {
 			return err
 		}
 		syncStream.advanceSendIndexLocked(len(records))
 	}
+	// End-of-history marker at the leader's real next index so the follower
+	// commits the correct history index and flips historySynced.
 	resp := &pdpb.SyncRegionResponse{
 		Header:     &pdpb.ResponseHeader{ClusterId: keypath.ClusterID()},
 		StartIndex: nextIndex,
